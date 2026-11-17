@@ -6,6 +6,7 @@
 // app.ts stays separate from main.ts: this file is the server; main.ts is the
 // entry <-> env lifecycle and is kept as the starter ships it.
 
+import { createHash } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
 import {
@@ -64,6 +65,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extraHeade
   const text = body === undefined ? '' : JSON.stringify(body);
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
+    'content-length': String(Buffer.byteLength(text)),
     'x-github-request-id': nextRequestId(),
     ...extraHeaders,
   });
@@ -96,18 +98,21 @@ const asBool = (value: unknown): boolean | undefined => (typeof value === 'boole
 
 // ---------------------------------------------------------------- serializers
 
+/** The viewer's REST shape: one constant object, shared by every serializer. */
+const USER_JSON: Readonly<Record<string, unknown>> = Object.freeze({
+  login: VIEWER_LOGIN,
+  id: VIEWER_ID,
+  node_id: globalId('User', String(VIEWER_ID)),
+  name: VIEWER_NAME,
+  email: VIEWER_EMAIL,
+  type: 'User',
+  site_admin: false,
+  url: `https://forge.invalid/api/v3/users/${VIEWER_LOGIN}`,
+  html_url: `https://forge.invalid/${VIEWER_LOGIN}`,
+});
+
 function userJson(): Record<string, unknown> {
-  return {
-    login: VIEWER_LOGIN,
-    id: VIEWER_ID,
-    node_id: globalId('User', String(VIEWER_ID)),
-    name: VIEWER_NAME,
-    email: VIEWER_EMAIL,
-    type: 'User',
-    site_admin: false,
-    url: `https://forge.invalid/api/v3/users/${VIEWER_LOGIN}`,
-    html_url: `https://forge.invalid/${VIEWER_LOGIN}`,
-  };
+  return USER_JSON as Record<string, unknown>;
 }
 
 function repoJson(repo: Repo): Record<string, unknown> {
@@ -293,6 +298,24 @@ function parseFetchArgsV0(body: Buffer): git.FetchArgs {
 
 // ---------------------------------------------------------------- git smart HTTP
 
+/**
+ * Fetch answers are pure functions of the request body and the object graph, and git
+ * objects are immutable once stored: the same wants/haves/depth always earns the same
+ * bytes. Concurrent identical fetches (the clone pattern) share one computed answer.
+ */
+const fetchCache = new Map<string, Buffer>();
+const FETCH_CACHE_LIMIT = 256;
+
+function cachedFetch(repo: Repo, body: Buffer, version2: boolean, compute: () => Buffer): Buffer {
+  const key = `${repo.id}:${version2 ? 'v2' : 'v0'}:${createHash('sha1').update(body).digest('hex')}`;
+  const hit = fetchCache.get(key);
+  if (hit !== undefined) return hit;
+  const answer = compute();
+  if (fetchCache.size >= FETCH_CACHE_LIMIT) fetchCache.delete(fetchCache.keys().next().value!);
+  fetchCache.set(key, answer);
+  return answer;
+}
+
 async function handleGit(
   req: IncomingMessage,
   res: ServerResponse,
@@ -345,13 +368,13 @@ async function handleGit(
           return;
         }
         if (command.command === 'fetch') {
-          sendRaw(res, 200, git.fetchV2(repo, parseFetchArgs(command.args)), 'application/x-git-upload-pack-result');
+          sendRaw(res, 200, cachedFetch(repo, body, true, () => git.fetchV2(repo, parseFetchArgs(command.args))), 'application/x-git-upload-pack-result');
           return;
         }
         sendJson(res, 400, { message: `Unsupported command ${command.command}` });
         return;
       }
-      sendRaw(res, 200, git.fetchV0(repo, parseFetchArgsV0(body)), 'application/x-git-upload-pack-result');
+      sendRaw(res, 200, cachedFetch(repo, body, false, () => git.fetchV0(repo, parseFetchArgsV0(body))), 'application/x-git-upload-pack-result');
       return;
     } catch (err) {
       sendJson(res, 400, { message: err instanceof Error ? err.message : 'Bad upload-pack request' });
